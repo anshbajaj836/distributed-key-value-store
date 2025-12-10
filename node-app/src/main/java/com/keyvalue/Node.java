@@ -18,6 +18,7 @@ public class Node {
     private static volatile int currentLeaderId = -1; // Who is the boss?
 
     // Configuration
+    private static WalLogger wal;
     private static final OkHttpClient client = new OkHttpClient.Builder().readTimeout(1, TimeUnit.SECONDS).build();
     private static int MY_ID;
     private static List<String> PEER_HOSTNAMES;
@@ -28,6 +29,12 @@ public class Node {
         PEER_HOSTNAMES = peersEnv.isEmpty() ? List.of() : Arrays.asList(peersEnv.split(","));
 
         System.out.println("--- NODE " + MY_ID + " STARTED ---");
+
+        // 1. INITIALIZE WAL & RECOVER
+        wal = new WalLogger(MY_ID);
+        wal.replay(kvStore); // Load old data from disk into RAM
+
+        System.out.println("--- NODE " + MY_ID + " STARTED (With WAL Persistence) ---");
 
         Javalin app = Javalin.create().start(7000);
 
@@ -50,6 +57,9 @@ public class Node {
         app.post("/internal/replicate/{key}/{value}", ctx -> {
             String key = ctx.pathParam("key");
             String value = ctx.pathParam("value");
+
+            // WAL STEP: Write to disk first!
+            wal.write(key, value);
 
             kvStore.put(key, value);
             System.out.println("--- [Replication] Leader told me to save " + key + "=" + value + " ---");
@@ -112,8 +122,12 @@ public class Node {
         // 2. I am Leader: Start the Clock
         System.out.println("--- [Write] Processing Quorum Write for " + key + " ---");
 
-        // Step A: Save locally (1 vote)
+        // WAL STEP: Write to local disk first!
+        wal.write(key, value);
         kvStore.put(key, value);
+
+//        // Step A: Save locally (1 vote)
+//        kvStore.put(key, value);
 
         // Step B: Send to all peers in PARALLEL and wait for results
         List<CompletableFuture<Boolean>> futures = new ArrayList<>();
@@ -199,7 +213,6 @@ public class Node {
             peerLastSeen.forEach((id, lastSeen) -> {
                 if (now - lastSeen < 5000) aliveNodes.add(id);
             });
-
 
             int newLeader = Collections.max(aliveNodes);
             if (newLeader != currentLeaderId) {

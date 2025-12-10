@@ -9,6 +9,8 @@ services:
       - playground-net
     ports:
       - "7001:7000" # map host port 7001 to container 7000
+    volumes:
+      - ./cluster-data/node-1:/app/data # Maps host folder to container folder
   node-2:
     build: ./node-app
     hostname: node-2
@@ -19,6 +21,8 @@ services:
       - playground-net
     ports:
       - "7002:7000"
+    volumes:
+      - ./cluster-data/node-2:/app/data
 
   node-3:
     build: ./node-app
@@ -30,7 +34,8 @@ services:
       - playground-net
     ports:
       - "7003:7000"
-
+    volumes:
+      - ./cluster-data/node-3:/app/data
 networks:
   playground-net:
     driver: bridge
