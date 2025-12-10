@@ -8,7 +8,7 @@ COPY src ./src
 RUN mvn clean package -DskipTests
 
 # Stage 2 create runtime image
-FROM eclipse-temurin:17-jre-apline
+FROM eclipse-temurin:25-jre-alpine
 
 WORKDIR /app
 
