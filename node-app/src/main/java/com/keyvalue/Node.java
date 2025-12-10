@@ -5,6 +5,7 @@ import io.javalin.http.Context;
 import okhttp3.*;
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
@@ -21,7 +22,7 @@ public class Node {
     private static int MY_ID;
     private static List<String> PEER_HOSTNAMES;
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws IOException {
         MY_ID = Integer.parseInt(System.getenv().getOrDefault("NODE_ID", "1"));
         String peersEnv = System.getenv().getOrDefault("PEERS", "");
         PEER_HOSTNAMES = peersEnv.isEmpty() ? List.of() : Arrays.asList(peersEnv.split(","));
@@ -36,7 +37,7 @@ public class Node {
         app.get("/ping", ctx -> ctx.result("Pong from " + MY_ID));
 
         // 2. Public Write Endpoint (The Entry Point)
-        app.post("/data/{key}/{value}", ctx -> handleWriteRequest(ctx));
+        app.post("/data/{key}/{value}", ctx -> handleStrongWrite(ctx));
 
         // 3. Public Read Endpoint
         app.get("/data/{key}", ctx -> {
@@ -49,6 +50,7 @@ public class Node {
         app.post("/internal/replicate/{key}/{value}", ctx -> {
             String key = ctx.pathParam("key");
             String value = ctx.pathParam("value");
+
             kvStore.put(key, value);
             System.out.println("--- [Replication] Leader told me to save " + key + "=" + value + " ---");
             ctx.status(200);
@@ -61,52 +63,119 @@ public class Node {
 
     // --- LOGIC HANDLERS ---
 
-    private static void handleWriteRequest(Context ctx) {
+    // private static void handleWriteRequest(Context ctx) {
+    //     String key = ctx.pathParam("key");
+    //     String value = ctx.pathParam("value");
+
+    //     // CASE A: I am not the leader -> Redirect
+    //     if (currentLeaderId != MY_ID) {
+    //         if (currentLeaderId == -1) {
+    //             ctx.status(503).result("No leader available");
+    //             return;
+    //         }
+    //         // Redirect client to the leader using host-mapped port (host: 7000 + leaderId)
+    //         int leaderHostPort = 7000 + currentLeaderId; // host ports: 7001,7002,7003
+    //         String leaderUrl = "http://localhost:" + leaderHostPort + "/data/" + key + "/" + value;
+    //         ctx.status(307).redirect(leaderUrl);
+    //         System.out.println("--- [Redirect] Redirecting client to Leader (Node " + currentLeaderId + ") at " + leaderUrl + " ---");
+    //         return;
+    //     }
+
+    //     // CASE B: I am the leader -> Save and Replicate
+    //     System.out.println("--- [Write] I am Leader. Saving " + key + "=" + value + " ---");
+
+    //     // 1. Save Locally
+    //     kvStore.put(key, value);
+
+    //     // 2. Replicate to others (Fire and Forget for now)
+    //     for (String peer : PEER_HOSTNAMES) {
+    //         replicateToPeer(peer, key, value);
+    //     }
+
+    //     ctx.result("Write Successful on Leader " + MY_ID);
+    // }
+
+    // --- THE HARD PART: QUORUM LOGIC ---
+    private static void handleStrongWrite(Context ctx) {
         String key = ctx.pathParam("key");
         String value = ctx.pathParam("value");
 
-        // CASE A: I am not the leader -> Redirect
+        // 1. Redirect if not leader
         if (currentLeaderId != MY_ID) {
-            if (currentLeaderId == -1) {
-                ctx.status(503).result("No leader available");
-                return;
-            }
-            // Redirect client to the leader using host-mapped port (host: 7000 + leaderId)
+            if (currentLeaderId == -1) { ctx.status(503).result("No Leader"); return; }
             int leaderHostPort = 7000 + currentLeaderId; // host ports: 7001,7002,7003
             String leaderUrl = "http://localhost:" + leaderHostPort + "/data/" + key + "/" + value;
             ctx.status(307).redirect(leaderUrl);
-            System.out.println("--- [Redirect] Redirecting client to Leader (Node " + currentLeaderId + ") at " + leaderUrl + " ---");
             return;
         }
 
-        // CASE B: I am the leader -> Save and Replicate
-        System.out.println("--- [Write] I am Leader. Saving " + key + "=" + value + " ---");
+        // 2. I am Leader: Start the Clock
+        System.out.println("--- [Write] Processing Quorum Write for " + key + " ---");
 
-        // 1. Save Locally
+        // Step A: Save locally (1 vote)
         kvStore.put(key, value);
 
-        // 2. Replicate to others (Fire and Forget for now)
+        // Step B: Send to all peers in PARALLEL and wait for results
+        List<CompletableFuture<Boolean>> futures = new ArrayList<>();
+
         for (String peer : PEER_HOSTNAMES) {
-            replicateToPeer(peer, key, value);
+            futures.add(CompletableFuture.supplyAsync(() -> sendReplicationSync(peer, key, value)));
         }
 
-        ctx.result("Write Successful on Leader " + MY_ID);
+        // Step C: Wait for all attempts to finish (or timeout)
+        try {
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+        } catch (Exception e) {
+            // Ignore exceptions, we just want to count successes
+        }
+
+        // Step D: Count Votes
+        long successCount = 1; // Start with 1 (Myself)
+        for (CompletableFuture<Boolean> f : futures) {
+            try {
+                if (f.getNow(false)) successCount++;
+            } catch (Exception e) {}
+        }
+
+        // Step E: Quorum Decision
+        int quorum = (PEER_HOSTNAMES.size() + 1) / 2 + 1; // (2+1)/2 + 1 = 2
+
+        if (successCount >= quorum) {
+            System.out.println("--- [Commit] Quorum reached (" + successCount + "/" + (PEER_HOSTNAMES.size()+1) + ") ---");
+            ctx.result("Write Successful (Replicated to " + successCount + " nodes)");
+        } else {
+            System.out.println("--- [Fail] Quorum failed (" + successCount + " votes). Data is unsafe! ---");
+            ctx.status(500).result("Write Failed: Cluster unstable (Only " + successCount + " nodes acknowledged)");
+            // Note: In a real DB, we would rollback here!
+        }
     }
 
-    private static void replicateToPeer(String peerHost, String key, String value) {
-        // Send to /internal/replicate endpoint
+    // private static void replicateToPeer(String peerHost, String key, String value) {
+    //     // Send to /internal/replicate endpoint
+    //     String url = "http://" + peerHost + ":7000/internal/replicate/" + key + "/" + value;
+    //     Request request = new Request.Builder().url(url).post(RequestBody.create(new byte[0])).build();
+
+    //     // Asynchronous call (don't wait for response to keep it simple)
+    //     client.newCall(request).enqueue(new Callback() {
+    //         @Override public void onFailure(Call call, IOException e) {
+    //             System.out.println("Failed to replicate to " + peerHost);
+    //         }
+    //         @Override public void onResponse(Call call, Response response) {
+    //             response.close();
+    //         }
+    //     });
+    // }
+
+    // Synchronous replication helper used by quorum writes (returns true on success)
+    private static boolean sendReplicationSync(String peerHost, String key, String value) {
         String url = "http://" + peerHost + ":7000/internal/replicate/" + key + "/" + value;
         Request request = new Request.Builder().url(url).post(RequestBody.create(new byte[0])).build();
-
-        // Asynchronous call (don't wait for response to keep it simple)
-        client.newCall(request).enqueue(new Callback() {
-            @Override public void onFailure(Call call, IOException e) {
-                System.out.println("Failed to replicate to " + peerHost);
-            }
-            @Override public void onResponse(Call call, Response response) {
-                response.close();
-            }
-        });
+        try (Response response = client.newCall(request).execute()) {
+            return response.isSuccessful();
+        } catch (Exception e) {
+            System.out.println("Failed to replicate (sync) to " + peerHost + ": " + e.getMessage());
+            return false;
+        }
     }
 
     // --- BACKGROUND THREADS (Same as before) ---
@@ -125,14 +194,17 @@ public class Node {
         while (true) {
             long now = System.currentTimeMillis();
             List<Integer> aliveNodes = new ArrayList<>();
+
             aliveNodes.add(MY_ID);
             peerLastSeen.forEach((id, lastSeen) -> {
                 if (now - lastSeen < 5000) aliveNodes.add(id);
             });
 
+
             int newLeader = Collections.max(aliveNodes);
             if (newLeader != currentLeaderId) {
                 System.out.println("--- [Election] New Leader is Node " + newLeader + " ---");
+                System.out.println(aliveNodes);
                 currentLeaderId = newLeader;
             }
             try { Thread.sleep(2000); } catch (InterruptedException e) {}
